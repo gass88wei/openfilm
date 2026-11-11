@@ -31,19 +31,11 @@ concurrency:
 
 jobs:
   build:
-    name: build (linux-${{ matrix.arch }})
+    name: build (linux-x64)
     # NOT ubuntu-latest: it is glibc 2.43, and a package built there needs that to start. This machine (deepin) is
     # glibc 2.38, so the runner is pinned below it: 22.04 is glibc 2.35, which starts on 2.38 and on 24.04 alike.
     runs-on: ubuntu-22.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        # x64 first: the deepin machine this was written for is x64
-        include:
-          - { arch: x64, out: linux-x64 }
-          # arm64 is built on this same x64 runner: electron-builder fetches the arm64 Electron, no emulation needed
-          - { arch: arm64, out: linux-arm64 }
     steps:
       - uses: actions/checkout@v4
 
@@ -53,33 +45,42 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      # electron-builder's .deb target runs dpkg and fakeroot; both are here, but say so plainly
+      # electron-builder's .deb target runs dpkg and fakeroot; xvfb is the display the smoke test opens a window on
       - name: The tools a .deb is made with
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends fakeroot dpkg rpm
+          sudo apt-get install -y -qq --no-install-recommends fakeroot dpkg rpm xvfb
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Build the .deb and the AppImage (--platform=linux --arch=${{ matrix.arch }})
+      - name: Build the .deb and the AppImage (--platform=linux --arch=x64)
         working-directory: apps/desktop
         env:
           # a Linux build is never signed, and nothing here notarizes: release.mjs skips both
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npm run release -- --platform=linux --arch=${{ matrix.arch }}
+        run: npm run release -- --platform=linux --arch=x64
 
-      # the app starts, and its window is drawn: the display fix (environment.mjs LINUX_KEYS) is what this proves.
-      # Xvfb is a display with no monitor, which is all a runner has
-      - name: The window opens under a virtual display
-        if: matrix.arch == 'x64'
+      - name: The .deb names dependencies that resolve
         run: |
-          # 22.04 names the ALSA library libasound2 (24.04 renames it libasound2t64): try both
-          sudo apt-get install -y -qq --no-install-recommends xvfb libnss3 libgbm1 libgtk-3-0 libasound2 || \
-            sudo apt-get install -y -qq --no-install-recommends libasound2t64
-          APP="$(find apps/desktop/.release/${{ matrix.out }}/out -maxdepth 2 -name 'openfilm' -type f -executable | head -1)"
+          DEB="$(ls apps/desktop/.release/linux-x64/out/*.deb)"
+          echo "checking $DEB"
+          dpkg-deb --info "$DEB" | sed -n '1,30p'
+          # a .deb whose Depends cannot be installed fails on the person's machine, not here: make it fail here
+          sudo dpkg -i "$DEB" || sudo apt-get -f install -y
+          dpkg -s openfilm >/dev/null || { echo "::error::The .deb did not install"; exit 1; }
+
+      # The point of the whole workflow. A package that installs is not a package that runs: this starts the installed
+      # program on a display that has no monitor, and fails on the two ways a Linux build of a Mac/Windows app breaks
+      # here — it cannot reach the display (environment.mjs LINUX_KEYS), or it needs a glibc this machine lacks.
+      - name: The installed app opens its window
+        run: |
+          APP="$(command -v openfilm || true)"
           if [ -z "$APP" ]; then
-            echo "::error::No packaged openfilm executable found; the unpacked build is missing"
-            find apps/desktop/.release/${{ matrix.out }}/out -maxdepth 3 | head -40
+            APP="$(find /opt -maxdepth 3 -name openfilm -type f -executable 2>/dev/null | head -1)"
+          fi
+          if [ -z "$APP" ]; then
+            echo "::error::The installed app has no openfilm executable"
+            dpkg -L openfilm | head -40
             exit 1
           fi
           echo "executable: $APP"
@@ -88,24 +89,31 @@ jobs:
           timeout 60 xvfb-run -a --server-args="-screen 0 1280x800x24" \
             "$APP" --no-sandbox --disable-gpu > /tmp/app.log 2>&1 || STATUS=$?
           echo "--- exit status: $STATUS ---"
-          tail -40 /tmp/app.log
+          tail -60 /tmp/app.log
+          # a glibc or libstdc++ this build needs and this machine does not have: the exact failure a wrong runner causes
+          if grep -qiE "GLIBC_[0-9]|CXXABI_[0-9]|GLIBCXX_[0-9]|version .GLIBC" /tmp/app.log; then
+            echo "::error::The build needs a newer glibc/libstdc++ than this runner has; it would not start on deepin"
+            grep -iE "GLIBC_[0-9]|CXXABI_[0-9]|GLIBCXX_[0-9]" /tmp/app.log | head -5
+            exit 1
+          fi
+          if grep -qiE "Missing Xserver|cannot open display|no display|DISPLAY is not set" /tmp/app.log; then
+            echo "::error::The app could not reach the display; environment.mjs LINUX_KEYS did not take effect"
+            exit 1
+          fi
           if [ "$STATUS" = "124" ]; then
             # still running when the 60 s ran out: the window opened and stayed up
             echo "The app ran until the 60 s timeout: the window opened."
-          elif grep -qiE "Missing Xserver|cannot open display|no display" /tmp/app.log; then
-            echo "::error::The app could not reach the display; environment.mjs LINUX_KEYS did not take effect"
-            exit 1
-          else
-            echo "The app exited by itself with status $STATUS; see the log above."
-            exit 1
+            exit 0
           fi
+          echo "::error::The app exited on its own with status $STATUS before the timeout"
+          exit 1
 
       - uses: actions/upload-artifact@v4
         with:
-          name: desktop-${{ matrix.out }}
+          name: desktop-linux-x64
           if-no-files-found: error
           retention-days: 14
           path: |
-            apps/desktop/.release/${{ matrix.out }}/out/*.deb
-            apps/desktop/.release/${{ matrix.out }}/out/*.AppImage
-            apps/desktop/.release/${{ matrix.out }}/out/latest*.yml
+            apps/desktop/.release/linux-x64/out/*.deb
+            apps/desktop/.release/linux-x64/out/*.AppImage
+            apps/desktop/.release/linux-x64/out/latest*.yml
