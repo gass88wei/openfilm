@@ -96,6 +96,17 @@ const pack = (dir) => execFileSync('npm', ['pack', '--ignore-scripts', '--pack-d
 const dependencies = { ...pkg.dependencies, openfilm: `file:../${pack(protocol)}` };
 /* npm takes the versions pnpm's lockfile has (locked-versions.mjs): what the tests ran with, not the latest */
 const lockedTree = JSON.parse(execFileSync('pnpm', ['list', '--prod', '--depth', 'Infinity', '--json'], { cwd: desktop, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 }))[0];
+/* a .deb needs three things a .dmg never asks for: a homepage, an author with an email, and a maintainer. They are
+   only added for a Linux build, so the Mac and Windows metadata stays what it was. `--homepage=` and `--maintainer=`
+   name your own (a fork publishes under its own address); the defaults are the fork this was written in */
+const homepage = process.argv.find((a) => a.startsWith('--homepage='))?.slice('--homepage='.length)
+  || process.env.OPENFILM_HOMEPAGE
+  || 'https://github.com/gass88wei/openfilm';
+const maintainer = process.argv.find((a) => a.startsWith('--maintainer='))?.slice('--maintainer='.length)
+  || process.env.OPENFILM_MAINTAINER
+  || 'gass88wei <142734115+gass88wei@users.noreply.github.com>';
+/** the bare address inside "Name <email>", which package.json's author.email wants */
+const maintainerEmail = /<([^>]+)>/.exec(maintainer)?.[1] ?? maintainer;
 writeFileSync(join(stage, 'package.json'), `${JSON.stringify({
   name: 'openfilm-desktop',
   productName: NAME,
@@ -109,6 +120,7 @@ writeFileSync(join(stage, 'package.json'), `${JSON.stringify({
   main: 'src/main.mjs',
   dependencies,
   overrides: lockedOverrides(lockedTree, pkg.dependencies),
+  ...(linux ? { homepage, author: { name: 'OpenFilm', email: maintainerEmail }, desktopName: 'openfilm.desktop' } : {}),
 }, null, 2)}\n`);
 run('npm', ['install', '--omit=dev', '--omit=optional', '--no-audit', '--no-fund', '--no-package-lock', '--loglevel=error'], { cwd: stage });
 const offLock = versionsOffLock(lockedTree, join(stage, 'node_modules'));
@@ -213,6 +225,11 @@ await builder.build({
       /* the executable inside the .deb and the AppImage, and what the smoke test looks for */
       executableName: 'openfilm',
       artifactName: `${NAME.replace(' ', '-')}-\${version}-\${arch}-linux.\${ext}`,
+      /* a .deb names the person who answers for it ("Name <email>"), which no other target asks */
+      maintainer,
+      vendor: 'OpenFilm',
+      /* the desktop entry's window association: without it, some desktops cannot match the window to the launcher */
+      syncDesktopName: true,
     },
   },
 });
