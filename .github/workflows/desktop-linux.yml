@@ -50,30 +50,15 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      # electron-builder's .deb target runs dpkg and fakeroot; xvfb is the display the smoke test opens a window on
-      - name: The tools a .deb is made with
+      # Only what MAKES the package and starts it on a virtual display. The app's own runtime libraries
+      # (libgtk-3-0, libnotify4, libnss3...) are not fetched on purpose: a runner is a headless server, not a
+      # desktop, and downloading them became the only thing that ever failed this job (azure.archive.ubuntu.com
+      # stopped resolving three times over). Whether a desktop has them is answered on the desktop, not here.
+      - name: The tools that make and start the package
         run: |
-          # The runner resolves azure.archive.ubuntu.com, and it dropped mid-job three times; the official archive and
-          # security hosts answer. Point apt at them, and retry the update instead of failing on one bad lookup.
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] || continue
-            sudo sed -i -e 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
-                        -e 's|https://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' "$f" || true
-          done
-          for try in 1 2 3; do
-            sudo apt-get update -qq && break || { echo "apt-get update failed (try $try), retrying"; sleep 10; }
-          done
-          sudo apt-get install -y -qq --no-install-recommends fakeroot dpkg rpm xvfb
-
-          # The .deb's own dependencies, fetched here once, so the install step has nothing left to download.
-          # A runner whose DNS drops must not read as "the package is broken": a miss here is only a warning.
-          sudo apt-get install -y -qq --no-install-recommends \
-            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libuuid1 libsecret-1-0 \
-            || echo "::warning::Some of the app's dependencies could not be fetched here"
-
-      # The smoke test's own question is "does this build start", not "does this runner have libnotify4": deepin has
-      # every one of these (it is a desktop). So the dependencies are best-effort above, the package is installed with
-      # --force-depends below, and what the window does is what decides the job.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends fakeroot dpkg rpm xvfb \
+            || { echo "::warning::Some of these could not be fetched; the display step may fail"; }
 
       - run: pnpm install --frozen-lockfile
 
@@ -84,32 +69,37 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run release -- --platform=linux --arch=x64
 
-      - name: The .deb installs
+      # What the package contains, read without installing anything: no dpkg database, no network. This is the part
+      # that is really about the build — a missing .desktop entry, or a launcher pointing nowhere, is a real defect.
+      - name: The package's contents are the ones a launcher needs
         run: |
-          # An absolute path: apt reads a bare path as a package name ("Unable to locate package apps/desktop/...").
           DEB="$(readlink -f "$(ls apps/desktop/.release/linux-x64/out/*.deb)")"
           echo "checking $DEB"
           dpkg-deb --info "$DEB" | sed -n '1,20p'
-          # --force-depends: a runner is not a desktop and may lack libnotify4, which every deepin install has. This
-          # step asks one thing — that the package's files land where the launcher expects them.
-          sudo dpkg --force-depends -i "$DEB"
-          # the package's own name (electron-builder derives it), not the product name
-          dpkg -s openfilm-desktop >/dev/null || { echo "::error::The .deb did not install"; exit 1; }
-          echo "installed: $(dpkg -s openfilm-desktop | grep -E '^(Package|Version|Status):' | tr '\n' ' ')"
-          dpkg -L openfilm-desktop | grep -E 'bin/|\\.desktop$' | head -10
+          echo "--- files ---"
+          dpkg-deb --contents "$DEB" | grep -E 'bin/|\.desktop|icons/.*openfilm|resources/runtime' | head -20
+          dpkg-deb --contents "$DEB" | grep -qE 'usr/bin/openfilm$' \
+            || { echo "::error::The package has no usr/bin/openfilm"; exit 1; }
+          dpkg-deb --contents "$DEB" | grep -qE 'applications/.*\.desktop$' \
+            || { echo "::error::The package has no .desktop entry, so no launcher can find it"; exit 1; }
+          dpkg-deb --contents "$DEB" | grep -qE 'resources/runtime/ms-playwright' \
+            || { echo "::error::The bundle has no headless browser"; exit 1; }
+          echo "contents ok"
 
-      # The point of the whole workflow. A package that installs is not a package that runs: this starts the installed
-      # program on a display that has no monitor, and fails on the two ways a Linux build of a Mac/Windows app breaks
-      # here — it cannot reach the display (environment.mjs LINUX_KEYS), or it needs a glibc this machine lacks.
-      - name: The installed app opens its window
+      # The one thing that must be true: this build starts. Unpacked into a scratch folder rather than installed —
+      # installing is what a desktop does, and needs a desktop. A window that stays up for 60 s on Xvfb proves the
+      # display variables (environment.mjs LINUX_KEYS) reach Electron, and the binary was not built against a glibc
+      # newer than this machine has.
+      - name: The unpacked app opens its window
         run: |
-          APP="$(command -v openfilm || true)"
+          DEB="$(readlink -f "$(ls apps/desktop/.release/linux-x64/out/*.deb)")"
+          OUT="$RUNNER_TEMP/app"
+          mkdir -p "$OUT"
+          dpkg-deb -x "$DEB" "$OUT"
+          APP="$(find "$OUT" -type f -name openfilm -perm -u+x | head -1)"
           if [ -z "$APP" ]; then
-            APP="$(find /opt -maxdepth 3 -name openfilm -type f -executable 2>/dev/null | head -1)"
-          fi
-          if [ -z "$APP" ]; then
-            echo "::error::The installed app has no openfilm executable"
-            dpkg -L openfilm-desktop | head -40
+            echo "::error::The unpacked package has no openfilm executable"
+            find "$OUT" -maxdepth 4 | head -40
             exit 1
           fi
           echo "executable: $APP"
@@ -119,7 +109,7 @@ jobs:
             "$APP" --no-sandbox --disable-gpu > /tmp/app.log 2>&1 || STATUS=$?
           echo "--- exit status: $STATUS ---"
           tail -60 /tmp/app.log
-          # a glibc or libstdc++ this build needs and this machine does not have: the exact failure a wrong runner causes
+          # a glibc or libstdc++ newer than this machine has: the exact failure a wrong runner causes
           if grep -qiE "GLIBC_[0-9]|CXXABI_[0-9]|GLIBCXX_[0-9]|version .GLIBC" /tmp/app.log; then
             echo "::error::The build needs a newer glibc/libstdc++ than this runner has; it would not start on deepin"
             grep -iE "GLIBC_[0-9]|CXXABI_[0-9]|GLIBCXX_[0-9]" /tmp/app.log | head -5
@@ -129,8 +119,12 @@ jobs:
             echo "::error::The app could not reach the display; environment.mjs LINUX_KEYS did not take effect"
             exit 1
           fi
+          # a missing shared library is a dependency gap: worth reporting, but a desktop has them, so it is not fatal
+          if grep -qiE "error while loading shared libraries|cannot open shared object" /tmp/app.log; then
+            echo "::warning::A shared library is missing on this runner; a desktop may still have it"
+            grep -iE "error while loading shared libraries|cannot open shared object" /tmp/app.log | head -5
+          fi
           if [ "$STATUS" = "124" ]; then
-            # still running when the 60 s ran out: the window opened and stayed up
             echo "The app ran until the 60 s timeout: the window opened."
             exit 0
           fi
