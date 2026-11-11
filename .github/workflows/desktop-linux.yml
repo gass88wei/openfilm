@@ -70,7 +70,8 @@ jobs:
       # breath, which is what a person double-clicking the file gets.
       - name: The .deb installs with its dependencies
         run: |
-          DEB="$(ls apps/desktop/.release/linux-x64/out/*.deb)"
+          # an absolute path: apt reads a bare path as a package name ("Unable to locate package apps/desktop/...")
+          DEB="$(readlink -f "$(ls apps/desktop/.release/linux-x64/out/*.deb)")"
           echo "checking $DEB"
           dpkg-deb --info "$DEB" | sed -n '1,20p'
           sudo apt-get install -y --no-install-recommends "$DEB"
