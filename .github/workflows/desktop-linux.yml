@@ -7,10 +7,15 @@ name: desktop-linux
 # Studio already run (`npx openfilm`).
 #
 # What it builds is a build of this source: product.json is empty in the repository, so the app never looks for updates.
-# Run it by hand (Actions → desktop-linux → Run workflow) or on a push to main.
+#
+# Two ways in:
+#   - a push to main (or Run workflow): build it, and prove it installs and opens a window. Nothing is published.
+#   - pushing a tag v<version>: the same build, then a GitHub release named for the tag gets the .deb and the AppImage.
 on:
   push:
     branches: [main]
+    # a tag publishes. GitHub does not evaluate `paths` for tag pushes, so v* always runs this.
+    tags: ['v*']
     paths:
       - apps/desktop/**
       - packages/openfilm/**
@@ -60,14 +65,18 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run release -- --platform=linux --arch=x64
 
-      - name: The .deb names dependencies that resolve
+      # `dpkg -i` only unpacks: a package whose dependencies are missing is left half-installed, which is what deepin's
+      # store then tries to fix by removing it. `apt-get install ./file.deb` resolves the dependencies in the same
+      # breath, which is what a person double-clicking the file gets.
+      - name: The .deb installs with its dependencies
         run: |
           DEB="$(ls apps/desktop/.release/linux-x64/out/*.deb)"
           echo "checking $DEB"
-          dpkg-deb --info "$DEB" | sed -n '1,30p'
-          # a .deb whose Depends cannot be installed fails on the person's machine, not here: make it fail here
-          sudo dpkg -i "$DEB" || sudo apt-get -f install -y
-          dpkg -s openfilm >/dev/null || { echo "::error::The .deb did not install"; exit 1; }
+          dpkg-deb --info "$DEB" | sed -n '1,20p'
+          sudo apt-get install -y --no-install-recommends "$DEB"
+          # the package's own name (electron-builder derives it), not the product name
+          dpkg -s openfilm-desktop >/dev/null || { echo "::error::The .deb did not install"; exit 1; }
+          echo "installed: $(dpkg -s openfilm-desktop | grep -E '^(Package|Version|Status):' | tr '\n' ' ')"
 
       # The point of the whole workflow. A package that installs is not a package that runs: this starts the installed
       # program on a display that has no monitor, and fails on the two ways a Linux build of a Mac/Windows app breaks
@@ -80,7 +89,7 @@ jobs:
           fi
           if [ -z "$APP" ]; then
             echo "::error::The installed app has no openfilm executable"
-            dpkg -L openfilm | head -40
+            dpkg -L openfilm-desktop | head -40
             exit 1
           fi
           echo "executable: $APP"
@@ -117,3 +126,58 @@ jobs:
             apps/desktop/.release/linux-x64/out/*.deb
             apps/desktop/.release/linux-x64/out/*.AppImage
             apps/desktop/.release/linux-x64/out/latest*.yml
+
+  # Only a tag publishes. The build job above has already proved this exact build installs and opens a window, so
+  # collecting the two artifacts is all that is left.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-linux-x64
+          path: dist
+
+      - name: The release notes (the changelog's entry for this version, else a line)
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          {
+            echo "OpenFilm $VERSION for Linux (x86_64), built from this fork's source."
+            echo
+            echo "Install:"
+            echo '```sh'
+            echo "sudo apt-get install ./OpenFilm-${VERSION}-amd64-linux.deb"
+            echo '```'
+            echo
+            echo "Or run the AppImage without installing it:"
+            echo '```sh'
+            echo "chmod +x OpenFilm-${VERSION}-x86_64-linux.AppImage && ./OpenFilm-${VERSION}-x86_64-linux.AppImage"
+            echo '```'
+            echo
+            echo "Built on Ubuntu 22.04 (glibc 2.35), so it starts on Debian, Ubuntu, deepin and their derivatives."
+            echo "Unsigned: no Linux signing key is used. It never looks for updates."
+          } > notes.md
+          echo "--- notes.md ---"
+          cat notes.md
+
+      - name: Create or update the release with the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -lh dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # the tag was pushed again: replace the files, keep the release
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "OpenFilm $TAG for Linux" \
+              --notes-file notes.md \
+              --verify-tag
+          fi
