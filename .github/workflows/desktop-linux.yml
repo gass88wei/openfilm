@@ -55,6 +55,12 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends fakeroot dpkg rpm xvfb
+          # The .deb's own dependencies, fetched here once: the install step below then has nothing left to download.
+          # A runner whose DNS drops (azure.archive.ubuntu.com did, twice) would otherwise fail at that step, which
+          # looks like a broken package. Their absence is not fatal: the install step retries and reports the truth.
+          sudo apt-get install -y -qq --no-install-recommends \
+            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libuuid1 libsecret-1-0 \
+            || echo "::warning::Some of the app's dependencies could not be fetched here; the install step will try again"
 
       - run: pnpm install --frozen-lockfile
 
@@ -74,7 +80,11 @@ jobs:
           DEB="$(readlink -f "$(ls apps/desktop/.release/linux-x64/out/*.deb)")"
           echo "checking $DEB"
           dpkg-deb --info "$DEB" | sed -n '1,20p'
-          sudo apt-get install -y --no-install-recommends "$DEB"
+          # --fix-missing and one retry: the runner's DNS dropped twice while fetching libnotify4, and that must not
+          # read as "the package is broken"
+          sudo apt-get install -y --no-install-recommends --fix-missing "$DEB" \
+            || { echo "first attempt failed; retrying after apt-get update"; sudo apt-get update -qq || true; \
+                 sudo apt-get install -y --no-install-recommends "$DEB"; }
           # the package's own name (electron-builder derives it), not the product name
           dpkg -s openfilm-desktop >/dev/null || { echo "::error::The .deb did not install"; exit 1; }
           echo "installed: $(dpkg -s openfilm-desktop | grep -E '^(Package|Version|Status):' | tr '\n' ' ')"
