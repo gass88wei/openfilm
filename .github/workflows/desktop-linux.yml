@@ -77,9 +77,15 @@ jobs:
           echo "checking $DEB"
           dpkg-deb --info "$DEB" | sed -n '1,20p'
           echo "--- files ---"
-          dpkg-deb --contents "$DEB" | grep -E 'bin/|\.desktop|icons/.*openfilm|resources/runtime' | head -20
-          dpkg-deb --contents "$DEB" | grep -qE 'usr/bin/openfilm$' \
-            || { echo "::error::The package has no usr/bin/openfilm"; exit 1; }
+          # the four paths the checks below read, one line each. head closes the pipe early and
+          # dpkg-deb's tar complains about that on its way out; silenced — it means nothing.
+          dpkg-deb --contents "$DEB" 2>/dev/null \
+            | grep -E '\./opt/OpenFilm/openfilm$|applications/.*\.desktop$|icons/.*openfilm|resources/runtime/ms-playwright/$' | head -10
+          # the executable sits at /opt/OpenFilm/openfilm — electron-builder puts it at
+          # /opt/<productName>/<executableName>, which the .desktop's Exec line names — and
+          # nothing is ever put in /usr/bin. Verified against the built 0.3.2 package itself.
+          dpkg-deb --contents "$DEB" | grep -qE '\./opt/OpenFilm/openfilm$' \
+            || { echo "::error::The package has no /opt/OpenFilm/openfilm executable"; exit 1; }
           dpkg-deb --contents "$DEB" | grep -qE 'applications/.*\.desktop$' \
             || { echo "::error::The package has no .desktop entry, so no launcher can find it"; exit 1; }
           dpkg-deb --contents "$DEB" | grep -qE 'resources/runtime/ms-playwright' \

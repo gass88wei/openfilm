@@ -1,8 +1,10 @@
 name: ci
+# Upstream's test suite (typecheck, tests on three systems, pack, audit). On this fork it runs by
+# hand only: the three-system matrix takes longer than the interval between pushes here, so with
+# the push trigger every run was cancelled by the next one before any test finished — a queue of
+# cancellations that said nothing about anything. This fork's check is desktop-linux.yml, which
+# builds what this fork exists to build.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
