@@ -48,14 +48,19 @@ const protocol = dirname(require.resolve('openfilm/package.json'));
 const asked = process.argv.find((a) => a.startsWith('--arch='))?.slice('--arch='.length);
 const arch = asked === 'x64' || asked === 'arm64' ? asked : process.arch === 'arm64' ? 'arm64' : 'x64';
 const win = process.argv.includes('--platform=win');
-const work = join(desktop, '.release', win ? `win-${arch}` : arch);
+/* --platform=linux: a .deb and an AppImage, built on Linux; no signing exists for them (none is needed) */
+const linux = process.argv.includes('--platform=linux');
+/** the platform this build is for, as electron-builder and the programs name it */
+const platform = win ? 'win32' : linux ? 'linux' : 'darwin';
+const work = join(desktop, '.release', win ? `win-${arch}` : linux ? `linux-${arch}` : arch);
 const stage = join(work, 'app');
 const out = join(work, 'out');
 /* the Developer ID ("Name (TEAMID)") and its team, from the environment (the release pipeline's secrets) */
 const IDENTITY = process.env.OPENFILM_SIGN_IDENTITY?.trim() || '';
 const TEAM_ID = process.env.APPLE_TEAM_ID?.trim() || '';
-const unsigned = process.argv.includes('--unsigned') || (!win && (!IDENTITY || !TEAM_ID));
-if (unsigned && !win && !process.argv.includes('--unsigned')) {
+/* only a Mac build is ever signed: Windows has no certificate yet, and Linux needs none */
+const unsigned = win || linux || process.argv.includes('--unsigned') || (!IDENTITY || !TEAM_ID);
+if (unsigned && !win && !linux && !process.argv.includes('--unsigned')) {
   console.warn('OPENFILM_SIGN_IDENTITY and APPLE_TEAM_ID are not set: building an unsigned app (not notarized). Official builds are signed by the release pipeline.');
 }
 
@@ -70,7 +75,7 @@ const productFile = join(protocol, official ? 'product.official.json' : 'product
 const product = JSON.parse(readFileSync(productFile, 'utf8'));
 const updates = typeof product.desktop?.updates === 'string' ? product.desktop.updates.trim().replace(/\/+$/, '') : '';
 /** Where the packaged app looks for updates (the release's files are uploaded there), or null: it never looks. */
-export const FEED = updates ? `${updates}/${win ? 'win' : 'mac'}/${arch}` : null;
+export const FEED = updates ? `${updates}/${win ? 'win' : linux ? 'linux' : 'mac'}/${arch}` : null;
 const NOTARY_PROFILE = process.env.OPENFILM_NOTARY_PROFILE || 'openfilm-notary';
 
 const run = (cmd, args, opts = {}) => execFileSync(cmd, args, { stdio: 'inherit', ...opts });
@@ -116,11 +121,11 @@ cpSync(productFile, join(stage, 'node_modules/openfilm/product.json'));
 /* 2b. ffmpeg and the headless browser, for the platform and chip built for */
 const runtime = join(work, 'runtime');
 const { ffmpegDownloadable, fetchFfmpeg } = await import(pathToFileURL(join(desktop, 'src/ffmpeg-runtime.mjs')).href);
-const platform = win ? 'win32' : 'darwin';
 if (ffmpegDownloadable(platform, arch)) await fetchFfmpeg(join(runtime, 'ffmpeg'), { platform, arch, license: true });
 else console.warn(`No ffmpeg build for ${platform}-${arch}: this app downloads none either; people install their own.`);
 run(process.execPath, [join(stage, 'node_modules/playwright-core/cli.js'), 'install', 'chromium-headless-shell'], {
-  env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: join(runtime, 'ms-playwright'), PLAYWRIGHT_HOST_PLATFORM_OVERRIDE: win ? 'win64' : arch === 'arm64' ? 'mac15-arm64' : 'mac15' },
+  /* a Linux build runs on Linux: Playwright's own platform is the right one, and no override is needed */
+  env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: join(runtime, 'ms-playwright'), ...(linux ? {} : { PLAYWRIGHT_HOST_PLATFORM_OVERRIDE: win ? 'win64' : arch === 'arm64' ? 'mac15-arm64' : 'mac15' }) },
 });
 
 /* 3. the app */
@@ -131,14 +136,14 @@ Object.assign(process.env, env);
 await builder.build({
   projectDir: stage,
   publish: 'never',
-  ...(win ? { win: ['nsis'] } : { mac: ['dmg', 'zip'] }),
+  ...(win ? { win: ['nsis'] } : linux ? { linux: ['deb', 'AppImage'] } : { mac: ['dmg', 'zip'] }),
   [arch]: true,
   config: {
     afterPack: win ? (context) => windowsResources(context) : undefined,
     /* unsigned on a Mac: signed ad hoc, whole, before the .dmg and .zip are made. Electron's fuses are written into
        its framework after the linker signed it, and an Apple chip kills a program whose pages no longer match its
        signature ("Code Signature Invalid") the moment it starts */
-    afterSign: !win && unsigned ? (context) => adHocSign(context) : undefined,
+    afterSign: !win && !linux && unsigned ? (context) => adHocSign(context) : undefined,
     win: {
       icon: join(desktop, 'build/icon.ico'),
       /* resedit writes the icon and version (afterPack); rcedit would need wine on this Mac */
@@ -197,6 +202,18 @@ await builder.build({
     },
     /* the downloads keep one name from version to version: the website links the latest release's by it */
     dmg: { title: NAME, artifactName: `${NAME.replace(' ', '-')}-\${arch}.\${ext}` },
+    linux: {
+      /* .deb: what Debian, Ubuntu and deepin install by double-clicking; AppImage: the same build, not installed.
+         `depends` is left to electron-builder: its list is the one its Electron needs, and naming our own would
+         leave out libsecret-1-0, libuuid1 and xdg-utils */
+      icon: join(desktop, 'build/icon.png'),
+      category: 'AudioVideo',
+      synopsis: 'Studio, with a chat beside it for coding agents',
+      description: 'OpenFilm turns any coding agent into a video agent: films as web pages, and Studio, the editor to change anything in them.',
+      /* the executable inside the .deb and the AppImage, and what the smoke test looks for */
+      executableName: 'openfilm',
+      artifactName: `${NAME.replace(' ', '-')}-\${version}-\${arch}-linux.\${ext}`,
+    },
   },
 });
 
@@ -218,9 +235,9 @@ if (!unsigned && !win && FEED) {
   writeFileSync(feed, readFileSync(feed, 'utf8').replace(new RegExp(`(- url: ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n\\s+sha512: )\\S+(\\n\\s+size: )\\d+`), `$1${sha512}$2${bytes.length}`));
   if (!readFileSync(feed, 'utf8').includes(sha512)) throw new Error('the feed does not list the signed .dmg');
 }
-console.log(`\n${readdirSync(out).filter((f) => /\.(dmg|zip|exe|yml)$/.test(f)).map((f) => join(out, f)).join('\n')}`);
+console.log(`\n${readdirSync(out).filter((f) => /\.(dmg|zip|exe|deb|AppImage|yml)$/.test(f)).map((f) => join(out, f)).join('\n')}`);
 console.log(`feed: ${FEED ?? 'none (a build of this source: it never looks for updates)'}`);
-if (FEED && !existsSync(join(out, win ? 'latest.yml' : 'latest-mac.yml'))) process.exitCode = 1;
+if (FEED && !existsSync(join(out, linux ? 'latest-linux.yml' : win ? 'latest.yml' : 'latest-mac.yml'))) process.exitCode = 1;
 
 /** An unsigned Mac app signed ad hoc (no identity), all of it, so it starts. @param {{ appOutDir: string }} context */
 function adHocSign(context) {

@@ -25,7 +25,12 @@ const OS_KEYS = ['HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG', 'TZ', 'SS
 const WIN_KEYS = ['SystemRoot', 'SystemDrive', 'windir', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE', 'USERNAME', 'USERDOMAIN',
   'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
   'CommonProgramFiles', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS'];
+/* what an X or Wayland program needs to reach the display the person is looking at: their display manager sets these
+   for every program it starts, a terminal included, so they come from the system, not from the shell's files */
+const LINUX_KEYS = ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR', 'XDG_SESSION_TYPE', 'XDG_CURRENT_DESKTOP',
+  'DBUS_SESSION_BUS_ADDRESS'];
 const windows = process.platform === 'win32';
+const linux = process.platform === 'linux';
 const isLocaleKey = (key) => /^LC_[A-Z_]+$/.test(key);
 const BASE_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 const PROXY_KEYS = ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'all_proxy', 'no_proxy'];
@@ -104,11 +109,12 @@ export const PATH_SEP = windows ? ';' : ':';
 /** PATH from an environment, whatever its case (Windows calls it Path). */
 export const pathOf = (env) => env.PATH ?? env.Path ?? Object.entries(env).find(([k]) => k.toLowerCase() === 'path')?.[1] ?? '';
 
-/** The OS identity variables only (HOME, USER, LOGNAME, SHELL, TMPDIR, LANG, LC_*, TZ). */
+/** The OS identity variables only (HOME, USER, LOGNAME, SHELL, TMPDIR, LANG, LC_*, TZ; and the display on Linux). */
 export function osEnvironment(source = process.env, { home = homedir(), shell = accountShell() } = {}) {
   const env = {};
   for (const [key, value] of Object.entries(source)) {
-    if (typeof value === 'string' && value && (OS_KEYS.includes(key) || isLocaleKey(key) || (windows && WIN_KEYS.some((k) => k.toLowerCase() === key.toLowerCase())))) env[key] = value;
+    if (typeof value !== 'string' || !value) continue;
+    if (OS_KEYS.includes(key) || isLocaleKey(key) || (windows && WIN_KEYS.some((k) => k.toLowerCase() === key.toLowerCase())) || (linux && LINUX_KEYS.includes(key))) env[key] = value;
   }
   if (windows) return env;
   env.HOME ??= home;
