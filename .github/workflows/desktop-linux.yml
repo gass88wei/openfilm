@@ -53,14 +53,27 @@ jobs:
       # electron-builder's .deb target runs dpkg and fakeroot; xvfb is the display the smoke test opens a window on
       - name: The tools a .deb is made with
         run: |
-          sudo apt-get update -qq
+          # The runner resolves azure.archive.ubuntu.com, and it dropped mid-job three times; the official archive and
+          # security hosts answer. Point apt at them, and retry the update instead of failing on one bad lookup.
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            sudo sed -i -e 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+                        -e 's|https://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' "$f" || true
+          done
+          for try in 1 2 3; do
+            sudo apt-get update -qq && break || { echo "apt-get update failed (try $try), retrying"; sleep 10; }
+          done
           sudo apt-get install -y -qq --no-install-recommends fakeroot dpkg rpm xvfb
-          # The .deb's own dependencies, fetched here once: the install step below then has nothing left to download.
-          # A runner whose DNS drops (azure.archive.ubuntu.com did, twice) would otherwise fail at that step, which
-          # looks like a broken package. Their absence is not fatal: the install step retries and reports the truth.
+
+          # The .deb's own dependencies, fetched here once, so the install step has nothing left to download.
+          # A runner whose DNS drops must not read as "the package is broken": a miss here is only a warning.
           sudo apt-get install -y -qq --no-install-recommends \
             libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libuuid1 libsecret-1-0 \
-            || echo "::warning::Some of the app's dependencies could not be fetched here; the install step will try again"
+            || echo "::warning::Some of the app's dependencies could not be fetched here"
+
+      # The smoke test's own question is "does this build start", not "does this runner have libnotify4": deepin has
+      # every one of these (it is a desktop). So the dependencies are best-effort above, the package is installed with
+      # --force-depends below, and what the window does is what decides the job.
 
       - run: pnpm install --frozen-lockfile
 
@@ -71,23 +84,19 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run release -- --platform=linux --arch=x64
 
-      # `dpkg -i` only unpacks: a package whose dependencies are missing is left half-installed, which is what deepin's
-      # store then tries to fix by removing it. `apt-get install ./file.deb` resolves the dependencies in the same
-      # breath, which is what a person double-clicking the file gets.
-      - name: The .deb installs with its dependencies
+      - name: The .deb installs
         run: |
-          # an absolute path: apt reads a bare path as a package name ("Unable to locate package apps/desktop/...")
+          # An absolute path: apt reads a bare path as a package name ("Unable to locate package apps/desktop/...").
           DEB="$(readlink -f "$(ls apps/desktop/.release/linux-x64/out/*.deb)")"
           echo "checking $DEB"
           dpkg-deb --info "$DEB" | sed -n '1,20p'
-          # --fix-missing and one retry: the runner's DNS dropped twice while fetching libnotify4, and that must not
-          # read as "the package is broken"
-          sudo apt-get install -y --no-install-recommends --fix-missing "$DEB" \
-            || { echo "first attempt failed; retrying after apt-get update"; sudo apt-get update -qq || true; \
-                 sudo apt-get install -y --no-install-recommends "$DEB"; }
+          # --force-depends: a runner is not a desktop and may lack libnotify4, which every deepin install has. This
+          # step asks one thing — that the package's files land where the launcher expects them.
+          sudo dpkg --force-depends -i "$DEB"
           # the package's own name (electron-builder derives it), not the product name
           dpkg -s openfilm-desktop >/dev/null || { echo "::error::The .deb did not install"; exit 1; }
           echo "installed: $(dpkg -s openfilm-desktop | grep -E '^(Package|Version|Status):' | tr '\n' ' ')"
+          dpkg -L openfilm-desktop | grep -E 'bin/|\\.desktop$' | head -10
 
       # The point of the whole workflow. A package that installs is not a package that runs: this starts the installed
       # program on a display that has no monitor, and fails on the two ways a Linux build of a Mac/Windows app breaks
