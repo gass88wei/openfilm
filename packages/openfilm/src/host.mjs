@@ -340,6 +340,7 @@ export async function launch({ headed = false, channel = headed ? 'chromium' : n
   const browser = extra.some((a) => a.startsWith('--use-angle')) ? await open([])
     : process.platform === 'darwin' ? await open(['--use-angle=metal'])
     : process.platform === 'win32' ? await onWindows(open)
+    : process.platform === 'linux' ? await onLinux(open)
     : await open([]);
   LIVE.add(browser);
   browser.on('disconnected', () => LIVE.delete(browser));
@@ -502,9 +503,14 @@ export function vulkanFirst(renderer = rendererOf, presents = presentsVideo) {
   return pick;
 }
 const onWindows = vulkanFirst();
+/** Linux too: the same negotiation, Vulkan first (Mesa's RADV on AMD and Intel, the vendor's ICD elsewhere). A machine
+   with no hardware answer — no ICD, or a renderer the SOFTWARE_GL test calls software — falls back to the default
+   (SwiftShader, on the CPU) exactly as before, so nothing that rendered keeps rendering. Measured on a deepin box with
+   an AMD Radeon 660M: a 2 727-frame film went from over an hour of CPU drawing to under three minutes. */
+const onLinux = vulkanFirst();
 
-/** A film's video frames were never seen (FilmPage.seek): on Windows, browsers opened from now on show video another way. */
-export const videoNotShown = () => (process.platform === 'win32' ? onWindows.videoNotShown() : Promise.resolve(false));
+/** A film's video frames were never seen (FilmPage.seek): on Windows and Linux, browsers opened from now on show video another way. */
+export const videoNotShown = () => (process.platform === 'win32' ? onWindows.videoNotShown() : process.platform === 'linux' ? onLinux.videoNotShown() : Promise.resolve(false));
 
 /** Every browser launch() opened and that is still open. */
 const LIVE = new Set();
@@ -577,7 +583,7 @@ const stuck = async (/** @type {import('playwright-core').Page} */ page) =>
 
 /** One web page in one browser tab. */
 export class FilmPage {
-  static async open(browser, origin, entry, { scale = 1, size = null, transparent = false, black = false, offline = false, network = {}, waitMs = 10_000, readyMs = READY_MS, onVideoNotShown = videoNotShown } = {}) {
+  static async open(browser, origin, entry, { scale = 1, size = null, transparent = false, black = false, offline = false, network = {}, /* a slow machine draws a page's first shaders on the CPU; 10 s was too short to live */ waitMs = 60_000, readyMs = READY_MS, onVideoNotShown = videoNotShown } = {}) {
     const film = new FilmPage();
     film.problems = [];
     film.onVideoNotShown = onVideoNotShown;
